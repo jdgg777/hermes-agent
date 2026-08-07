@@ -220,7 +220,11 @@ def _(rid, params: dict) -> dict:
             # Fail closed: refuse the turn and leave memory/DB unchanged.
             if (db := _get_db()) is not None:
                 try:
-                    db.replace_messages(session["session_key"], truncated)
+                    # Fall back to session id when session_key is NULL — CLI-origin
+                    # sessions created before the session_key default fix have no
+                    # key, and replace_messages(None) triggers an FK violation.
+                    truncation_key = session.get("session_key") or sid
+                    db.replace_messages(truncation_key, truncated)
                 except Exception as exc:
                     logger.error(
                         "prompt.submit: replace_messages failed for session %s "

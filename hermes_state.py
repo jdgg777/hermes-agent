@@ -3188,6 +3188,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """
         def _do(conn):
             system_prompt_hash = self._store_system_prompt(conn, system_prompt)
+            # Default session_key to the session id so every row has a non-NULL
+            # key. The Desktop's history-truncation path (methods_prompt.py) calls
+            # replace_messages(session["session_key"], ...) — a NULL session_key
+            # makes that INSERT violate the messages.session_id FK →
+            # "FOREIGN KEY constraint failed" → "Restore failed" on resume.
+            effective_session_key = session_key or session_id
             conn.execute(
                 """INSERT INTO sessions (
                    id, source, user_id, session_key, chat_id, chat_type, thread_id,
@@ -3220,7 +3226,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     session_id,
                     source,
                     user_id,
-                    session_key,
+                    effective_session_key,
                     chat_id,
                     chat_type,
                     thread_id,
