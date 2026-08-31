@@ -41,6 +41,9 @@ class _RecordingSessionDB:
 
     def __init__(self, *args, **kwargs):
         self.ended: list[tuple[str, str]] = []
+        self.appended: list[tuple[str, dict]] = []
+        # Start with the configured next_lifecycle; append_message may flip
+        # it to 'complete' so the second probe sees the post-ack state.
         self.lifecycle = type(self).next_lifecycle
 
     next_lifecycle = "complete"
@@ -54,7 +57,17 @@ class _RecordingSessionDB:
     def session_lifecycle_statuses(self, session_ids):
         if isinstance(type(self).next_lifecycle, Exception):
             raise type(self).next_lifecycle
-        return {sid: type(self).next_lifecycle for sid in session_ids}
+        return {sid: self.lifecycle for sid in session_ids}
+
+    def append_message(self, session_id, **kwargs):
+        self.appended.append((session_id, kwargs))
+        # Mirror the real SessionDB: an assistant row becomes the session's
+        # last message, so the lifecycle classifier flips to 'complete' for
+        # subsequent probes (exactly what hermes_state.classify_session_status
+        # does when the latest row is an assistant text message).
+        if kwargs.get("role") == "assistant" and not kwargs.get("tool_calls"):
+            self.lifecycle = "complete"
+        return len(self.appended)
 
     def end_session(self, session_id, reason):
         self.ended.append((session_id, reason))
@@ -151,3 +164,44 @@ def test_classification_probe_failure_keeps_historical_reason(monkeypatch, tmp_p
 
     reasons = [reason for _sid, reason in instances[0].ended]
     assert reasons == ["cron_complete"]
+
+
+def test_interrupted_run_persists_acknowledgment_before_booking(
+    monkeypatch, tmp_path
+):
+    """When the session ends ``interrupted`` (dangling tool result / user
+    turn), the scheduler must persist a final assistant-row acknowledgment
+    BEFORE calling ``end_session``. The ack flips the lifecycle classifier
+    to ``complete`` so downstream replayers don't see a malformed tail, and
+    it gives the Telegram/console surface a human-readable failure record.
+    Booking still reports cron_incomplete_no_output — the run genuinely
+    failed; the ack is documentation, not a promotion.
+    """
+    _RecordingSessionDB.next_lifecycle = "interrupted"
+
+    instances = _run_booked_job(monkeypatch, tmp_path)
+
+    assert instances, "SessionDB was never constructed"
+    db = instances[0]
+
+    # Ack must be persisted on the session BEFORE end_session is called.
+    # (append_message happens inside the same finally-block, but the
+    # invariant we care about is: there is at least one assistant row with
+    # the cron-ack prefix recorded against the run's session id.)
+    acks = [
+        (sid, kw)
+        for sid, kw in db.appended
+        if kw.get("role") == "assistant"
+        and (kw.get("content") or "").startswith("[cron-ack]")
+    ]
+    assert acks, "no interruption acknowledgment was persisted"
+    sid, kw = acks[0]
+    assert "lifecycle=interrupted" in kw["content"]
+    # finish_reason=stop is the classifier's "healthy assistant tail" marker.
+    assert kw.get("finish_reason") == "stop"
+    # The second classifier probe (after the ack) flipped the lifecycle.
+    assert db.lifecycle == "complete"
+    # Booking still reports the run as incomplete — the ack is metadata,
+    # not a promotion of a failed run.
+    reasons = [r for _sid, r in db.ended]
+    assert reasons == ["cron_incomplete_no_output"]

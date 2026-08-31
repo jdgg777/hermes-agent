@@ -6713,6 +6713,14 @@ def run_job(
     except Exception as e:
         error_msg = f"{type(e).__name__}: {str(e)}"
         logger.exception("Job '%s' failed: %s", job_name, error_msg)
+        # Stash for the finally-block acknowledgment writer. The ack helper
+        # reads this to mention what class of failure ended the turn (NIM
+        # upstream timeout, admission-budget exhaustion, LiteLLM disconnect,
+        # etc.) instead of a generic "something failed" placeholder. Setting
+        # the local here is safe even when _final_cron_session_id was never
+        # bound because the writer performs its own "did we ever open a
+        # session?" guard before touching the db.
+        _run_failure_text = error_msg
         # Best-effort audit write on failure path. _audit_fire_id
         # may be unset if the exception fired before submit() — guard
         # with a None check so the audit write itself never raises.
@@ -6864,6 +6872,39 @@ def run_job(
                 )
                 _lifecycle = _statuses.get(_final_cron_session_id)
                 if _lifecycle in ("interrupted", "error", "empty"):
+                    # Before booking the run as failed, leave a persisted
+                    # assistant-row acknowledgment so the session's final
+                    # message is no longer a dangling tool result / user
+                    # prompt. This (a) flips the lifecycle classifier to
+                    # 'complete' for downstream replayers and (b) gives the
+                    # Telegram/console surface a human-readable record of
+                    # *why* the run terminated. Fail-open: any error here
+                    # must not block booking.
+                    _ack_text = _build_interruption_ack(
+                        job_name=job_name,
+                        lifecycle=_lifecycle,
+                        failure_text=locals().get("_run_failure_text"),
+                    )
+                    try:
+                        _session_db.append_message(
+                            _final_cron_session_id,
+                            role="assistant",
+                            content=_ack_text,
+                            finish_reason="stop",
+                        )
+                        # Re-stamp the lifecycle so the booking reflects the
+                        # post-ack state (still records the failure as
+                        # incomplete, but the session row itself is now
+                        # well-formed for downstream consumers).
+                        _statuses = _session_db.session_lifecycle_statuses(
+                            [_final_cron_session_id]
+                        )
+                    except (Exception, KeyboardInterrupt) as _ack_err:
+                        logger.debug(
+                            "Job '%s': interruption acknowledgment insert "
+                            "failed; continuing with original booking: %s",
+                            job_id, _ack_err,
+                        )
                     _end_reason = "cron_incomplete_no_output"
                     logger.warning(
                         "Job '%s': session ended without a final assistant "
@@ -6898,6 +6939,45 @@ def run_job(
                 defer_agent_teardown.append(agent)
         else:
             _teardown_cron_agent(agent, job_id)
+
+
+def _build_interruption_ack(
+    *,
+    job_name: str,
+    lifecycle: str,
+    failure_text: Optional[str],
+) -> str:
+    """Compose the human-readable assistant acknowledgment persisted when a
+    cron turn terminates without a final assistant message.
+
+    Goals:
+      1. Be honest about *what* ended the turn — surface the upstream /
+         classifier-visible failure text when present, instead of a generic
+         "something broke" placeholder.
+      2. Be structured enough for watchdogs to pattern-match — keep the
+         leading marker ``[cron-ack]`` and the lifecycle label stable.
+      3. Stay short: this row lands at the tail of an already-noisy
+         transcript and is the message downstream dashboards and Telegram
+         consumers will see when they list session history.
+
+    The caller is expected to wrap this write in its own try/except so a
+    storage failure here can never mask the booking decision.
+    """
+    reason = (failure_text or "").strip()
+    # Trim stack-trace-style verbosity to keep the ack consumable.
+    if len(reason) > 220:
+        reason = reason[:220].rstrip() + "…"
+    bits = [
+        "[cron-ack]",
+        f"job={job_name!r}",
+        f"lifecycle={lifecycle}",
+    ]
+    if reason:
+        bits.append(f"reason={reason}")
+    else:
+        bits.append("reason=upstream failure (no error text captured)")
+    bits.append("action=session closed; rerun scheduled per cron cadence")
+    return " ".join(bits)
 
 
 def _teardown_cron_agent(
