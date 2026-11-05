@@ -106,8 +106,10 @@ async def test_finite_runs_create_oneshot_sessions_and_explicit_source_wins(monk
         async def rpc(self, method, **params):
             if method == "runtime.describe":
                 return {"session_create": {"sources": sources, "parameters": ["cwd", "request_id", "source"]}}
+            if method == 'session.detach':
+                return {'detached': True}
             created.append(params["source"])
-            return {"stored_session_id": "stored"}
+            return {"stored_session_id": "stored", "subscription_id": "viewer"}
 
     @asynccontextmanager
     async def connected():
@@ -326,7 +328,7 @@ async def test_oneshot_z_writes_no_session_lines_to_stderr_like_main(monkeypatch
         async def rpc(self, method, **params):
             if method == "runtime.describe":
                 return {"session_create": {"sources": ["cli", "oneshot"], "parameters": ["cwd", "request_id", "source"]}}
-            return {"stored_session_id": "stored-z"}
+            return {"stored_session_id": "stored-z", "subscription_id": "viewer-z"}
 
     @asynccontextmanager
     async def connected():

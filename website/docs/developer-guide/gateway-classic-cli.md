@@ -43,6 +43,12 @@ gateway crash (clear it with `hermes sessions discard <id> --yes`), and 130 for 
 keyboard detach. A pending control does not imply cancellation. `-z` no longer
 implicitly bypasses approval policy.
 
+Successful finite launches explicitly close their newly created, untitled
+`oneshot` session through the owner's `session.detach` lifecycle API with
+`end_reason=cli_exit`. Resumed or titled sessions, explicit non-oneshot sources,
+and failed, blocked, interrupted or unknown outcomes remain resumable. The owner
+still fences pending work and other attached viewers before finalizing.
+
 ## Launch options
 
 The gateway advertises its accepted creation parameters through `runtime.describe`

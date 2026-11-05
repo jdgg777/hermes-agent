@@ -242,7 +242,14 @@ async def run_gateway_chat(args, emitter=None):
                 merged = isinstance(metadata, dict) and metadata.get(MODEL_ONLY_DISPLAY_METADATA_KEY)
                 if row.get("role") in {"user", "assistant"} and isinstance(row.get("content"), str) and not merged:
                     print(f"{row['role']}: {row['content']}")
-        return await view.run(query, oneshot=oneshot)
+        exit_code = await view.run(query, oneshot=oneshot)
+        # Only a newly created ephemeral conversation belongs to this finite launch.
+        # Resumes and blocked/unknown runs remain available for another viewer.
+        created = not latest and not getattr(args, 'resume', None) and not title
+        if created and oneshot and source == 'oneshot' and exit_code == 0:
+            await client.rpc('session.detach', session_id=snapshot['stored_session_id'],
+                             subscription_id=snapshot['subscription_id'], end_reason='cli_exit')
+        return exit_code
 
 
 _RESUME_POLICY_MISMATCH = "Resume retains gateway session policy; creation overrides are unsupported on resume."
