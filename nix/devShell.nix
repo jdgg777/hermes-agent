@@ -18,10 +18,7 @@
         map (p: p.passthru.packageJsonPath or null) packages
       );
 
-      # Non-npm packages may have their own devShellHook (e.g. hermes-agent
-      # stamps pyproject.toml + uv.lock for Python venv setup).
-      nonNpmHooks = map (p: p.passthru.devShellHook or "") packages;
-      combinedNonNpm = pkgs.lib.concatStringsSep "\n" (builtins.filter (h: h != "") nonNpmHooks);
+      hermesAgentDevShellHook = self'.packages.default.passthru.devShellHook;
     in
     {
       devShells.default = pkgs.mkShell {
@@ -30,11 +27,7 @@
             mkdir -p $out/bin
             install -Dm755 ${../hermes} $out/bin/hermes
           '')
-          (pkgs.runCommand "dev-sandbox" { } ''
-            mkdir -p $out/bin
-            install -Dm755 ${../scripts/dev-sandbox.sh} $out/bin/sandbox
-          '')
-          uv
+          self'.packages.sandbox
           # Headless Wayland compositor for E2E tests (test:e2e:visual).
           # cage renders a single client with no window management, so
           # the Electron window opens at a fixed size without tiling.
@@ -49,18 +42,25 @@
         ]
         ++ self'.packages.default.passthru.devDeps;
         shellHook = ''
-          ${combinedNonNpm}
+          # for the devshell to pick up the src (the pm hook reads it)
+          export HERMES_PYTHON_SRC_ROOT=$(git rev-parse --show-toplevel)
+
+          ${hermesAgentDevShellHook}
           ${hermesNpmLib.mkNpmDevShellHook npmPackageJsonPaths}
 
           # Force Node to use Nix's playwright-test binary instead of node_modules/.bin
           export PATH="${pkgs.playwright-test}/bin:$PATH"
 
-          # for the devshell to pick up the src
-          export HERMES_PYTHON_SRC_ROOT=$(git rev-parse --show-toplevel)
+          # Let `uv run --active --no-sync` reuse the Nix-built venv instead of
+          # creating an empty project .venv. Named explicitly: `python` on PATH
+          # is the lock's interpreter, which is not inside a venv.
+          export VIRTUAL_ENV="${self'.packages.default.passthru.devPython}"
 
-          # Let `uv run --active --no-sync` reuse Nix's provisioned Python
-          # environment instead of creating an empty project .venv.
-          export VIRTUAL_ENV="$(dirname "$(dirname "$(readlink -f "$(command -v python)")")")"
+          # The lock's interpreter is python-build-standalone, whose OpenSSL has
+          # no compiled-in NixOS trust store; point it at the CA bundle so
+          # urllib/httpx/requests verify certificates like the nixpkgs one.
+          export SSL_CERT_FILE="${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
+          export NIX_SSL_CERT_FILE="$SSL_CERT_FILE"
 
           echo "Hermes Agent dev shell in $HERMES_PYTHON_SRC_ROOT"
           echo "Ready. Run 'hermes' or 'sandbox hermes' to start."
